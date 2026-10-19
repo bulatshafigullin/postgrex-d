@@ -1,0 +1,8 @@
+.dub/
+*.a
+*.o
+dub.selections.json
+/postgrex-d
+tests/integration
+examples/vibe_app/vibe_app
+docs/

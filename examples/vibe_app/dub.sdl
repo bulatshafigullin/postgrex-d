@@ -1,0 +1,7 @@
+name "vibe_app"
+description "vibe.d web app using postgrex-d through a fiber-aware connection pool"
+targetType "executable"
+dependency "vibe-d" version="~>0.10.0"
+dependency "postgrex-d" path="../.."
+// macOS/Homebrew: the default `openssl` link is OpenSSL 4 which lacks DTLSv1_* symbols
+lflags "-L/opt/homebrew/opt/openssl@3/lib" platform="osx"

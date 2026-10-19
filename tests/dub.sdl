@@ -1,0 +1,5 @@
+name "integration"
+description "Integration tests; need a running PostgreSQL (PGD_URL)"
+targetType "executable"
+sourceFiles "integration.d"
+dependency "postgrex-d" path=".."
