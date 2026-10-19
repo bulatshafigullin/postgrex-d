@@ -224,6 +224,171 @@ void testLru(PgConnection db)
     }
 }
 
+
+string base() { return environment.get("PGD_URL", "postgres://postgres:secret@127.0.0.1:54329/postgres"); }
+
+void testTls()
+{
+    static assert(tlsAvailable, "integration tests need the tls configuration");
+    const certs = environment.get("PGD_CERTS", "/tmp/pgd_certs");
+    bool isSsl(PgConnection c) { return c.query("select ssl from pg_stat_ssl where pid = pg_backend_pid()").scalar!bool; }
+
+    auto o = ConnectOptions.fromUrl(base());
+    o.sslMode = SslMode.disable;
+    auto c = new PgConnection(o); c.connect();
+    check(!c.encrypted && !isSsl(c), "sslmode=disable is plain");
+    c.close();
+
+    o.sslMode = SslMode.require;
+    c = new PgConnection(o); c.connect();
+    check(c.encrypted && isSsl(c), "sslmode=require encrypts");
+    check(c.query("select repeat('x', 100000)").scalar!string.length == 100000, "large result over TLS");
+    c.close();
+
+    o.sslMode = SslMode.prefer;
+    c = new PgConnection(o); c.connect();
+    check(c.encrypted && isSsl(c), "sslmode=prefer picks TLS");
+    c.close();
+
+    o.sslMode = SslMode.verifyFull;
+    o.host = "localhost";
+    o.sslRootCert = certs ~ "/ca.crt";
+    c = new PgConnection(o); c.connect();
+    check(c.encrypted && isSsl(c), "verify-full with right CA and host name");
+    c.close();
+
+    o.host = "127.0.0.1";
+    c = new PgConnection(o); c.connect();
+    check(c.encrypted, "verify-full by IP (SAN)");
+    c.close();
+
+    o.sslRootCert = certs ~ "/other.crt";
+    expectThrows({ auto b = new PgConnection(o); b.connect(); }, "verify-full with the wrong CA must fail");
+    o.sslMode = SslMode.verifyCa;
+    expectThrows({ auto b = new PgConnection(o); b.connect(); }, "verify-ca with the wrong CA must fail");
+    o.sslRootCert = null;
+    expectThrows({ auto b = new PgConnection(o); b.connect(); }, "verify-ca needs a root cert");
+
+    // URL parsing
+    auto u = ConnectOptions.fromUrl("postgres://u:p@h/d?sslmode=verify-full&sslrootcert=%2Ftmp%2Fca.crt");
+    check(u.sslMode == SslMode.verifyFull && u.sslRootCert == "/tmp/ca.crt", "sslmode URL parsing");
+}
+
+void testCancel()
+{
+    auto o = ConnectOptions.fromUrl(base());
+    o.statementTimeout = 300.msecs;
+    auto db = new PgConnection(o);
+    db.connect();
+    scope (exit) db.close();
+    auto sw = StopWatch(AutoStart.yes);
+    try { db.query("select pg_sleep(10)"); check(false, "should time out"); }
+    catch (PgServerException e) { check(e.code == "57014", "query_canceled sqlstate " ~ e.code); }
+    check(sw.peek < 3.seconds, "timeout is prompt: " ~ sw.peek.toString);
+    check(db.connected && db.txStatus == TxStatus.idle, "connection usable after timeout");
+    check(db.query("select 5").scalar!int == 5, "query after timeout");
+    // a fast command is not affected by the armed timer
+    foreach (i; 0 .. 20) db.query("select $1::int", i);
+    sleep(500.msecs);
+    check(db.query("select 6").scalar!int == 6, "late timer does not cancel next command");
+
+    // timeouts work for simple queries and inside transactions too
+    try { db.simpleQuery("select pg_sleep(10)"); check(false, "simple should time out"); }
+    catch (PgServerException e) { check(e.code == "57014", "simple query cancelled"); }
+    expectThrows({ db.transaction((c) { c.query("select pg_sleep(10)"); }); }, "txn timeout");
+    check(db.txStatus == TxStatus.idle, "idle after cancelled transaction");
+
+    // explicit cancel() from another fiber
+    auto db2 = new PgConnection(base());
+    db2.connect();
+    scope (exit) db2.close();
+    spawn({ sleep(200.msecs); db2.cancel(); });
+    sw.reset();
+    try { db2.query("select pg_sleep(10)"); check(false, "should be cancelled"); }
+    catch (PgServerException e) { check(e.code == "57014", "explicit cancel"); }
+    check(sw.peek < 3.seconds, "explicit cancel is prompt");
+    check(db2.query("select 7").scalar!int == 7, "usable after explicit cancel");
+    db2.cancel(); // idle: harmless
+    check(db2.query("select 8").scalar!int == 8, "usable after idle cancel");
+}
+
+void testCopy(PgConnection db)
+{
+    db.exec("create temp table cp(id int, txt text, n int, arr int[])");
+    auto n = db.copyIn("copy cp from stdin", (PgConnection.CopyWriter cw) {
+        cw.row(1, "plain", 10, [1, 2]);
+        cw.row(2, "tab\there\nnewline\\backslash\rcr", null, [3]);
+        cw.row(3, "unicode ✓ ключ", 30, null);
+        cw.row(4, Nullable!string.init, 40, new int[0]);
+        foreach (i; 5 .. 1005) cw.row(i, "bulk", i, [i, i + 1]);
+    });
+    check(n == 1004, "copyIn rows " ~ n.to_str);
+    auto r = db.query("select * from cp order by id");
+    check(r.length == 1004, "copyIn stored");
+    check(r[1].get!string("txt") == "tab\there\nnewline\\backslash\rcr", "copy escaping round trip");
+    check(r[1]["n"].isNull && r[3]["txt"].isNull && r[2]["arr"].isNull, "copy NULLs");
+    check(r[0].get!(int[])("arr") == [1, 2] && r[2].get!string("txt") == "unicode ✓ ключ", "copy values");
+
+    // raw CSV through write()
+    db.exec("create temp table cp2(a int, b text)");
+    db.copyIn("copy cp2 from stdin (format csv)", (PgConnection.CopyWriter cw) {
+        cw.write("1,\"hello, world\"\n");
+        cw.write(cast(const(ubyte)[]) "2,\"multi\nline\"\n");
+    });
+    check(db.query("select count(*) from cp2").scalar!long == 2, "csv copyIn");
+
+    // callback failure aborts the copy and rethrows
+    db.exec("create temp table cp3(a int)");
+    expectThrows({
+        db.copyIn("copy cp3 from stdin", (PgConnection.CopyWriter cw) {
+            cw.row(1); cw.row(2);
+            throw new Exception("producer failed");
+        });
+    }, "copyIn producer exception");
+    check(db.query("select count(*) from cp3").scalar!long == 0, "nothing loaded after abort");
+    check(db.txStatus == TxStatus.idle, "idle after aborted copy");
+
+    // server-side error (bad data) surfaces as PgServerException
+    try
+    {
+        db.copyIn("copy cp3 from stdin", (PgConnection.CopyWriter cw) { cw.row("not a number"); });
+        check(false, "bad copy data");
+    }
+    catch (PgServerException e) { check(e.code == "22P02", "copyIn data error " ~ e.code); }
+    check(db.query("select 1").scalar!int == 1, "usable after copy error");
+
+    // not a COPY statement
+    expectThrows({ db.copyIn("select 1", (PgConnection.CopyWriter cw) {}); }, "copyIn on non-COPY");
+    expectThrows({ db.copyOut("select 1", (const(ubyte)[] d) {}); }, "copyOut on non-COPY");
+    check(db.query("select 2").scalar!int == 2, "usable after wrong copy");
+
+    // copyOut
+    ubyte[] got;
+    auto m = db.copyOut("copy (select i, 'v' || i from generate_series(1, 5) i) to stdout", (const(ubyte)[] d) { got ~= d; });
+    check(m == 5 && got == cast(const(ubyte)[]) "1\tv1\n2\tv2\n3\tv3\n4\tv4\n5\tv5\n", "copyOut data");
+
+    // sink failure cancels the rest of a huge COPY quickly
+    auto sw = StopWatch(AutoStart.yes);
+    size_t chunks;
+    expectThrows({
+        db.copyOut("copy (select i, md5(i::text) from generate_series(1, 20000000) i) to stdout", (const(ubyte)[] d) {
+            if (++chunks == 3) throw new Exception("enough");
+        });
+    }, "copyOut sink exception");
+    check(sw.peek < 10.seconds, "copyOut cancel is prompt: " ~ sw.peek.toString);
+    check(db.query("select 3").scalar!int == 3, "usable after copyOut cancel");
+
+    // inside a transaction, and rolled back
+    db.exec("create temp table cp5(a int)");
+    expectThrows({
+        db.transaction((c) {
+            c.copyIn("copy cp5 from stdin", (PgConnection.CopyWriter cw) { cw.row(1); cw.row(2); });
+            throw new Exception("rollback please");
+        });
+    }, "txn with copy");
+    check(db.query("select count(*) from cp5").scalar!long == 0, "copy rolled back");
+}
+
 void testNotify(PgConnection db, ConnectOptions o)
 {
     db.exec("listen chan");
@@ -320,11 +485,14 @@ void run()
     testTransactions(db);
     testMapping(db);
     testStreaming(db);
+    testCopy(db);
     testLru(db);
     testNotify(db, o);
     db.close();
     check(!db.connected, "closed");
     expectThrows!PgException({ auto b = new PgConnection("postgres://postgres:wrong@127.0.0.1:54329/postgres"); b.connect(); }, "bad password");
+    testTls();
+    testCancel();
     testPool(o);
 }
 

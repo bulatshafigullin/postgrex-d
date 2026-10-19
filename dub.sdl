@@ -9,3 +9,9 @@ importPaths "source"
 dependency "vibe-core" version=">=2.0.0"
 configuration "library" {
 }
+// TLS support (sslmode=require / verify-*): needs OpenSSL. Select it from your project with
+//   subConfiguration "postgrex-d" "tls"
+configuration "tls" {
+    dependency "vibe-stream:tls" version=">=1.0.0"
+    versions "PostgrexTLS"
+}

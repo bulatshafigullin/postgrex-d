@@ -21,14 +21,32 @@ struct ByteSink
 }
 
 /// Escapes `"` and `\` for use inside a quoted array element.
-struct EscSink
+struct EscSink(S)
 {
-    ByteSink inner;
+    S inner;
     void put(char c)
     {
         if (c == '"' || c == '\\')
             inner.put('\\');
         inner.put(c);
+    }
+    void put(const(char)[] s) { foreach (c; s) put(c); }
+}
+
+/// Escapes values for COPY ... FROM STDIN text format (`\\`, tab, newline, carriage return).
+struct CopyEscSink(S)
+{
+    S inner;
+    void put(char c)
+    {
+        switch (c)
+        {
+        case '\\': inner.put("\\\\"); break;
+        case '\t': inner.put("\\t"); break;
+        case '\n': inner.put("\\n"); break;
+        case '\r': inner.put("\\r"); break;
+        default: inner.put(c);
+        }
     }
     void put(const(char)[] s) { foreach (c; s) put(c); }
 }
@@ -149,9 +167,7 @@ void writeText(S, T)(ref S s, auto ref const T v)
             else
             {
                 s.put('"');
-                auto es = EscSink(ByteSink(null));
-                static if (is(S == ByteSink)) es.inner = s;
-                else static assert(false);
+                auto es = EscSink!S(s);
                 writeText(es, e);
                 s.put('"');
             }

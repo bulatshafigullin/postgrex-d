@@ -12,6 +12,8 @@ modelled on Elixir's [Postgrex](https://github.com/elixir-ecto/postgrex).
   the calling fiber, never the event loop or the thread. Works in plain vibe-core programs and in
   [vibe.d](https://vibed.org) request handlers.
 - **`@safe` API**, injection-safe by construction (parameters travel separately from SQL).
+- **TLS** (`sslmode` up to `verify-full`), **COPY** in both directions, and **query cancellation** with
+  server-side statement timeouts.
 - **GC-friendly.** One buffer per result, lazy decoding, and a zero-buffering streaming API.
 
 ## Contents
@@ -23,6 +25,9 @@ modelled on Elixir's [Postgrex](https://github.com/elixir-ecto/postgrex).
 - [Reading results](#reading-results)
 - [Transactions](#transactions)
 - [Connection pool and vibe.d](#connection-pool-and-vibed)
+- [TLS](#tls)
+- [Timeouts and cancellation](#timeouts-and-cancellation)
+- [COPY (bulk load and export)](#copy-bulk-load-and-export)
 - [Error handling](#error-handling)
 - [LISTEN / NOTIFY](#listen--notify)
 - [Type mapping](#type-mapping)
@@ -44,6 +49,15 @@ dependency "postgrex-d" repository="git+https://github.com/bulatshafigullin/post
 or, for local development, `dependency "postgrex-d" path="../postgrex-d"`.
 
 vibe-core is pulled in automatically. In a vibe.d project you already have it.
+
+TLS is optional because it needs OpenSSL. To enable it, select the `tls` configuration of this package:
+
+```sdl
+subConfiguration "postgrex-d" "tls"
+```
+
+Without it the driver is pure D with no native dependencies; `sslmode=prefer` then silently uses plain TCP
+and `require` / `verify-*` fail with a clear error.
 
 ## Quick start
 
@@ -83,14 +97,19 @@ o.user = "app";
 o.password = "secret";
 o.database = "app";
 o.connectTimeout = 5.seconds;
-o.queryTimeout = 30.seconds;       // per-read timeout, Duration.max = none
+o.queryTimeout = 30.seconds;       // socket read timeout, Duration.max = none
+o.statementTimeout = 10.seconds;   // cancels the running statement on the server, see below
+o.sslMode = SslMode.verifyFull;    // see the TLS section
+o.sslRootCert = "/etc/ssl/pg-ca.pem";
 o.statementCacheSize = 128;        // 0 disables the prepared-statement cache
 o.parameters["search_path"] = "app";
 auto db2 = new PgConnection(o);
 ```
 
 Supported authentication: trust, cleartext, MD5, SCRAM-SHA-256 (the server signature is verified).
-Percent-encode special characters in URL passwords (`@` -> `%40`).
+Percent-encode special characters in URL passwords (`@` -> `%40`). URL parameters understood by the
+driver: `sslmode`, `sslrootcert`, `application_name`; anything else is sent to the server as a
+startup parameter (`search_path`, `statement_timeout`, ...).
 
 ## Running queries
 
@@ -203,6 +222,82 @@ finish in ~0.5 s on a single thread.
 Pools and connections belong to the thread that created them (vibe-core rule); create one pool per
 thread if you run vibe.d with worker threads.
 
+## TLS
+
+Requires the `tls` configuration (see [Installation](#installation)). The modes mirror libpq's `sslmode`:
+
+| `SslMode` / URL value | Behaviour |
+|---|---|
+| `disable` | never use TLS |
+| `prefer` (default) | use TLS if the server offers it; **no certificate check** |
+| `require` | TLS or fail; no certificate check (protects against passive sniffing only) |
+| `verifyCa` / `verify-ca` | TLS, certificate must chain to `sslRootCert` |
+| `verifyFull` / `verify-full` | like `verify-ca` and the certificate must match the host name or IP |
+
+```d
+auto o = ConnectOptions.fromUrl("postgres://app:pw@db.example.com/app?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fpg-ca.pem");
+auto db = new PgConnection(o);
+db.connect();
+assert(db.encrypted);
+```
+
+**Use `verify-full` for anything that crosses an untrusted network**: `prefer` and `require` accept
+any certificate and are open to active man-in-the-middle attacks. vibe-stream does not load the system
+trust store, so the `verify-*` modes need `sslRootCert` (a PEM file). Client certificates and channel
+binding are not supported yet.
+
+## Timeouts and cancellation
+
+- `queryTimeout` is a socket read timeout: if the server is silent that long the connection is
+  considered dead and closed.
+- `statementTimeout` limits the run time of one command. When it expires the driver sends a
+  CancelRequest, the server aborts the statement and the call throws `PgServerException` with SQLSTATE
+  `57014`. **The connection stays usable.** It applies to `query`, `simpleQuery`, `queryEach`, `copyIn`
+  and `copyOut`, including inside transactions.
+- `db.cancel()` can be called from another fiber to abort whatever the connection is running.
+- Server-enforced alternative: `?statement_timeout=10000` in the URL (milliseconds).
+
+```d
+try db.query("select * from huge_view");
+catch (PgServerException e)
+{
+    if (e.code == "57014") return gatewayTimeout();
+    throw e;
+}
+```
+
+The cancel protocol is inherently racy: a request that reaches the server just after the command finished
+can abort the *next* command on that connection. `statementTimeout` guards against stale timers, but an
+explicit `cancel()` carries this caveat. Cancel requests are sent over a separate plain TCP connection
+(as libpq did before PostgreSQL 17); they carry only a one-time key, not data.
+
+## COPY (bulk load and export)
+
+COPY is by far the fastest way to move many rows. Both directions are streaming and use constant memory.
+
+```d
+// load: rows are written in text format (tab separated, NULL as \N, values escaped for you)
+long n = db.copyIn("copy users(id, name, tags) from stdin", (PgConnection.CopyWriter cw) {
+    foreach (u; users)
+        cw.row(u.id, u.name, u.tags);          // same argument types as query parameters
+});
+
+// raw data in any COPY format (CSV, ...)
+db.copyIn("copy t from stdin (format csv)", (PgConnection.CopyWriter cw) {
+    cw.write("1,\"hello, world\"\n");
+});
+
+// export: the sink receives chunks (valid only during the call)
+auto file = File("users.tsv", "wb");
+db.copyOut("copy users to stdout", (const(ubyte)[] chunk) { file.rawWrite(chunk); });
+```
+
+- If the `copyIn` callback throws, the COPY is aborted (nothing is loaded) and your exception is rethrown.
+- If the `copyOut` sink throws, the rest of the export is cancelled on the server and the exception is rethrown.
+- Data errors (wrong type, constraint violation) arrive as `PgServerException` after the stream ends.
+- `cw.row` produces text format only; for `format binary` write the bytes yourself with `cw.write`.
+- COPY runs inside `transaction(...)` like any other command, so it can be rolled back.
+
 ## Error handling
 
 All exceptions derive from `PgException`:
@@ -271,7 +366,9 @@ streaming grows the heap by 0.6 MB. Build your application with `-O -release` (L
 
 - **Use `PgPool` in servers**, one connection per concurrent operation. Never share a bare `PgConnection`
   between request handlers for transactions; use `pool.transaction` or `pool.lock()`.
-- **Always pass values as parameters**, and set `queryTimeout` so a stuck query cannot hang a fiber forever.
+- **Always pass values as parameters**, and set `statementTimeout` (and `queryTimeout`) so a stuck query
+  cannot hang a fiber forever.
+- **Use `verify-full` TLS** across untrusted networks, and `copyIn` instead of loops of `INSERT` for bulk loads.
 - **Stream big result sets** with `queryEach` instead of `query`.
 - **Keep transactions short** and do no network I/O (HTTP calls, etc.) inside them.
 - **Prefer explicit column lists** over `select *`; a cached statement is re-prepared automatically
@@ -283,9 +380,8 @@ streaming grows the heap by 0.6 MB. Build your application with `-O -release` (L
 
 ## Limitations
 
-TLS (`sslmode=require` raises an error), COPY, unix-domain sockets, binary result format, query
-cancellation, and `SASLprep` for non-ASCII SCRAM passwords are not implemented yet. Contributions
-welcome.
+Unix-domain sockets, binary result format, client certificates / channel binding, `SASLprep` for
+non-ASCII SCRAM passwords, and replication / logical decoding are not implemented yet. Contributions welcome.
 
 ## Development and testing
 
@@ -294,7 +390,11 @@ welcome.
 initdb -D /tmp/pgd -U postgres --auth-host=scram-sha-256 --pwfile=<(echo secret)
 pg_ctl -D /tmp/pgd -o "-p 54329" start
 
-# integration tests (103 checks: types, params, errors, cache, transactions, notify, pool, streaming)
+# for the TLS tests: a CA and a server certificate valid for localhost / 127.0.0.1 in $PGD_CERTS
+# (default /tmp/pgd_certs: ca.crt, other.crt = unrelated CA), then set ssl=on in postgresql.conf
+
+# integration tests (145 checks: types, params, errors, cache, transactions, notify, pool, streaming,
+# TLS, cancellation, COPY)
 cd tests && PGD_URL=postgres://postgres:secret@127.0.0.1:54329/postgres dub run
 
 # GC benchmark
@@ -302,7 +402,7 @@ PGD_URL=... dub run --single bench/bench.d --build=release
 ```
 
 Layout: `source/postgrex/` -- `connection.d` (protocol state machine), `pool.d`, `result.d`, `types.d`
-(decoding), `encode.d` (parameter encoding), `auth.d` (MD5/SCRAM), `wire.d` (framing), `error.d`.
+(decoding), `encode.d` (parameter encoding), `transport.d` (TCP / TLS), `auth.d` (MD5/SCRAM), `wire.d` (framing), `error.d`.
 
 ## License
 

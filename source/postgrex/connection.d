@@ -17,7 +17,8 @@ import std.conv : to;
 import std.string : indexOf, split, startsWith, toLower;
 import std.typecons : Nullable;
 import std.uri : decodeComponent;
-import vibe.core.net : TCPConnection, connectTCP, anyAddress, resolveHost;
+import postgrex.transport;
+import vibe.core.core : createTimer, Timer;
 import vibe.core.sync : RecursiveTaskMutex;
 
 /// Transaction state as reported by ReadyForQuery.
@@ -37,8 +38,16 @@ struct ConnectOptions
     string database;
     string applicationName = "postgrex-d";
     Duration connectTimeout = 10.seconds;
-    /// Per-read timeout (Duration.max = none).
+    /// Socket read timeout: fails the connection when the server is silent for this long
+    /// (Duration.max = none).
     Duration queryTimeout = Duration.max;
+    /// Maximum run time of one command. When exceeded a CancelRequest is sent, the server aborts the
+    /// statement (SQLSTATE 57014) and the connection stays usable (Duration.max = none).
+    Duration statementTimeout = Duration.max;
+    /// TLS policy, see `SslMode`. Default `prefer` uses TLS when the build and the server support it.
+    SslMode sslMode = SslMode.prefer;
+    /// PEM file with the CA certificate(s) for `verifyCa` / `verifyFull`.
+    string sslRootCert;
     /// Max number of cached prepared statements per connection (0 disables caching).
     size_t statementCacheSize = 128;
     /// Additional startup parameters (e.g. "search_path").
@@ -100,9 +109,17 @@ struct ConnectOptions
             {
             case "application_name": o.applicationName = v; break;
             case "sslmode":
-                if (v.canFind("require") || v.startsWith("verify"))
-                    throw new PgException("sslmode=" ~ v ~ " is not supported (TLS not implemented)");
+                switch (v)
+                {
+                    case "disable": o.sslMode = SslMode.disable; break;
+                    case "allow", "prefer": o.sslMode = SslMode.prefer; break;
+                    case "require": o.sslMode = SslMode.require; break;
+                    case "verify-ca": o.sslMode = SslMode.verifyCa; break;
+                    case "verify-full": o.sslMode = SslMode.verifyFull; break;
+                    default: throw new PgException("invalid sslmode: " ~ v);
+                }
                 break;
+            case "sslrootcert": o.sslRootCert = v; break;
             default: o.parameters[k] = v; break;
             }
         }
@@ -122,7 +139,8 @@ private ptrdiff_t lastIndexOfPort(string hostport)
 final class PgConnection
 {
     private ConnectOptions opts;
-    private TCPConnection sock;
+    private Transport sock;
+    private ulong cmdSeq;              // identifies the running command for timeout cancellation
     private bool open_;
     private RecursiveTaskMutex mutex;
     private MsgWriter w;
@@ -161,6 +179,8 @@ final class PgConnection
     }
 
     @property bool connected() const { return open_; }
+    /// True when the connection is encrypted with TLS.
+    @property bool encrypted() const { return open_ && sock.encrypted; }
     @property TxStatus txStatus() const { return txStatus_; }
     @property int backendPid() const { return backendPid_; }
     @property const(string[string]) serverParameters() const { return serverParams_; }
@@ -180,10 +200,8 @@ final class PgConnection
         if (open_) return;
         try
         {
-            sock = connectTCP(opts.host, opts.port, null, 0, opts.connectTimeout);
-            if (opts.queryTimeout != Duration.max)
-                sock.readTimeout = opts.queryTimeout;
-            sock.tcpNoDelay = true;
+            sock = Transport.connect(opts.host, opts.port, opts.connectTimeout, opts.queryTimeout,
+                                     opts.sslMode, opts.sslRootCert);
             open_ = true;
             txStatus_ = TxStatus.idle;
             savepointDepth = 0;
@@ -310,6 +328,57 @@ final class PgConnection
                 return type;
             }
         }
+    }
+
+    // ----------------------------------------------------------------- cancellation
+
+    /// Ask the server to abort the command this connection is currently running. May be called from
+    /// another fiber while a query is in flight; the running call then fails with a
+    /// `PgServerException` with code "57014" and the connection stays usable. Does nothing useful
+    /// when the connection is idle. (The protocol is inherently racy: a cancel that arrives just
+    /// after the command finished can hit the next one.)
+    void cancel()
+    {
+        if (!open_)
+            return;
+        auto t = Transport.connect(opts.host, opts.port, opts.connectTimeout, opts.connectTimeout,
+                                   SslMode.disable, null);
+        scope (exit) t.close();
+        ubyte[16] msg;
+        import std.bitmanip : nativeToBigEndian;
+        msg[0 .. 4] = nativeToBigEndian(16);
+        msg[4 .. 8] = nativeToBigEndian(80877102);
+        msg[8 .. 12] = nativeToBigEndian(backendPid_);
+        msg[12 .. 16] = nativeToBigEndian(backendKey_);
+        t.write(msg[]);
+        t.flush();
+        // the server closes the socket once it has processed the request
+        try { ubyte[1] b; t.read(b[]); } catch (Exception) {}
+    }
+
+    /// Arms `statementTimeout` for the command about to run; call `stop` on the result when done.
+    private struct Deadline
+    {
+        Timer timer;
+        bool armed;
+        void stop() { if (armed) { timer.stop(); armed = false; } }
+    }
+
+    private Deadline armDeadline()
+    {
+        Deadline d;
+        if (opts.statementTimeout == Duration.max)
+            return d;
+        const seq = ++cmdSeq;
+        d.timer = createTimer(() nothrow @safe {
+            if (seq != cmdSeq)
+                return;
+            try cancel();
+            catch (Exception) {}
+        });
+        d.timer.rearm(opts.statementTimeout);
+        d.armed = true;
+        return d;
     }
 
     // ------------------------------------------------------------------- startup
@@ -444,6 +513,8 @@ final class PgConnection
         w.cstr(sql);
         w.finish(true);
         send();
+        auto deadline = armDeadline();
+        scope (exit) deadline.stop();
 
         Result[] results;
         Collector col;
@@ -480,8 +551,8 @@ final class PgConnection
                     if (!err.isNull)
                         throw new PgServerException(err.get);
                     return results;
-                case 'G', 'H', 'W': // COPY not supported through this API
-                    throw new PgProtocolException("COPY is not supported");
+                case 'G', 'H', 'W': // COPY needs copyIn / copyOut
+                    throw new PgProtocolException("COPY must be run with copyIn / copyOut");
                 default:
                     throw new PgProtocolException("unexpected message '" ~ t ~ "'");
                 }
@@ -561,6 +632,8 @@ final class PgConnection
         w.begin('S');
         w.finish(true);
         send();
+        auto deadline = armDeadline();
+        scope (exit) deadline.stop();
 
         Nullable!PgNotice err;
         for (;;)
@@ -830,6 +903,203 @@ final class PgConnection
                 catch (Exception) {} // closed by scope(exit): unknown state, do not reuse
             }
             throw e;
+        }
+    }
+
+    // ----------------------------------------------------------------------- COPY
+
+    /// Sink handed to the `copyIn` callback.
+    static final class CopyWriter
+    {
+        private PgConnection c;
+        private this(PgConnection c) { this.c = c; }
+
+        /// Send raw COPY data (any chunking; format must match the COPY statement).
+        void write(const(ubyte)[] data)
+        {
+            while (data.length)
+            {
+                const n = data.length > 65536 ? 65536 : data.length;
+                c.w.begin('d');
+                c.w.raw(data[0 .. n]);
+                c.w.finish(true);
+                data = data[n .. $];
+                c.flushCopy();
+            }
+        }
+
+        /// ditto
+        void write(string data) { write(cast(const(ubyte)[]) data); }
+
+        /// Send one row in text format (tab separated, `\N` for NULL) for `COPY t FROM STDIN`.
+        /// Accepts the same argument types as query parameters.
+        void row(Args...)(auto ref Args args)
+        {
+            c.w.begin('d');
+            auto sink = ByteSink(c.w);
+            static foreach (i; 0 .. Args.length)
+            {
+                static if (i > 0)
+                    sink.put('\t');
+                if (isNullArg(args[i]))
+                    sink.put("\\N");
+                else
+                {
+                    auto es = CopyEscSink!ByteSink(sink);
+                    writeText(es, args[i]);
+                }
+            }
+            sink.put('\n');
+            c.w.finish(true);
+            c.flushCopy(false);
+        }
+    }
+
+    private void flushCopy(bool force = true)
+    {
+        if (force || w.length >= 65536)
+            send();
+    }
+
+    /// `COPY ... FROM STDIN`: the callback streams data through the `CopyWriter`. Returns the number of
+    /// rows copied. If the callback throws, the COPY is aborted (nothing is loaded) and the exception
+    /// is rethrown; the connection stays usable.
+    ///
+    /// ---
+    /// db.copyIn("copy users(id, name) from stdin", (CopyWriter cw) {
+    ///     foreach (u; users) cw.row(u.id, u.name);
+    /// });
+    /// ---
+    long copyIn(string sql, scope void delegate(CopyWriter) @safe fill)
+    {
+        mutex.lock();
+        scope (exit) mutex.unlock();
+        requireOpen();
+        w.clear();
+        w.begin('Q');
+        w.cstr(sql);
+        w.finish(true);
+        send();
+        auto deadline = armDeadline();
+        scope (exit) deadline.stop();
+
+        Nullable!PgNotice err;
+        bool ready;
+        // wait for CopyInResponse (or an error)
+        while (!ready)
+        {
+            Cursor c;
+            const t = nextMessage(c);
+            switch (t)
+            {
+            case 'G': ready = true; break;
+            case 'E': err = parseNotice(c); break;
+            case 'Z':
+                txStatus_ = cast(TxStatus) c.byte_();
+                if (!err.isNull) throw new PgServerException(err.get);
+                throw new PgException("statement is not a COPY FROM STDIN");
+            case 'T', 'D', 'C', 'I': break; // not a COPY statement: drain to ReadyForQuery
+            default: throw fail(new PgProtocolException("unexpected message '" ~ t ~ "' starting COPY"));
+            }
+        }
+
+        Exception userErr;
+        try fill(new CopyWriter(this));
+        catch (Exception e)
+        {
+            if (!open_)
+                throw e;
+            userErr = e;
+        }
+
+        if (userErr is null)
+        {
+            w.begin('c'); // appended to any rows still buffered
+            w.finish(true);
+        }
+        else
+        {
+            w.clear(); // drop a possibly half-written row
+            w.begin('f');
+            w.cstr(userErr.msg);
+            w.finish(true);
+        }
+        send();
+
+        long affected;
+        for (;;)
+        {
+            Cursor c;
+            const t = nextMessage(c);
+            switch (t)
+            {
+            case 'C': affected = affectedRows(c.cstr()); break;
+            case 'E': err = parseNotice(c); break;
+            case 'Z':
+                txStatus_ = cast(TxStatus) c.byte_();
+                if (userErr !is null)
+                    throw userErr;
+                if (!err.isNull)
+                    throw new PgServerException(err.get);
+                return affected;
+            default: throw fail(new PgProtocolException("unexpected message '" ~ t ~ "' during COPY"));
+            }
+        }
+    }
+
+    /// `COPY ... TO STDOUT`: `sink` receives the data in chunks (valid only during the call; the
+    /// boundaries are the server's, not row boundaries). Returns the number of rows. If `sink`
+    /// throws, the command is cancelled and the exception rethrown.
+    long copyOut(string sql, scope void delegate(const(ubyte)[]) @safe sink)
+    {
+        mutex.lock();
+        scope (exit) mutex.unlock();
+        requireOpen();
+        w.clear();
+        w.begin('Q');
+        w.cstr(sql);
+        w.finish(true);
+        send();
+        auto deadline = armDeadline();
+        scope (exit) deadline.stop();
+
+        Nullable!PgNotice err;
+        Exception userErr;
+        long affected;
+        bool started;
+        for (;;)
+        {
+            Cursor c;
+            const t = nextMessage(c);
+            switch (t)
+            {
+            case 'T', 'D', 'I': break; // not a COPY statement: drain to ReadyForQuery
+            case 'H': started = true; break;
+            case 'd':
+                if (userErr is null)
+                {
+                    try sink(c.rest);
+                    catch (Exception e)
+                    {
+                        userErr = e;
+                        try cancel(); catch (Exception) {} // stop the server from sending the rest
+                    }
+                }
+                break;
+            case 'c': break;
+            case 'C': affected = affectedRows(c.cstr()); break;
+            case 'E': err = parseNotice(c); break;
+            case 'Z':
+                txStatus_ = cast(TxStatus) c.byte_();
+                if (userErr !is null)
+                    throw userErr;
+                if (!err.isNull)
+                    throw new PgServerException(err.get);
+                if (!started)
+                    throw new PgException("statement is not a COPY TO STDOUT");
+                return affected;
+            default: throw fail(new PgProtocolException("unexpected message '" ~ t ~ "' during COPY"));
+            }
         }
     }
 

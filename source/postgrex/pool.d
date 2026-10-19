@@ -48,6 +48,18 @@ final class PgPool
         return c.queryEach(sql, dg, args);
     }
 
+    long copyIn(string sql, scope void delegate(PgConnection.CopyWriter) @safe fill)
+    {
+        auto c = lock();
+        return c.copyIn(sql, fill);
+    }
+
+    long copyOut(string sql, scope void delegate(const(ubyte)[]) @safe sink)
+    {
+        auto c = lock();
+        return c.copyOut(sql, sink);
+    }
+
     long exec(Args...)(string sql, auto ref Args args)
     {
         auto c = lock();
