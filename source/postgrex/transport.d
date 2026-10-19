@@ -9,7 +9,8 @@ module postgrex.transport;
 
 import postgrex.error;
 import core.time : Duration;
-import vibe.core.net : TCPConnection, connectTCP;
+import std.socket : AddressFamily;
+import vibe.core.net : TCPConnection, connectTCP, NetworkAddress;
 
 version (PostgrexTLS)
 {
@@ -30,6 +31,79 @@ enum SslMode
 version (PostgrexTLS) enum tlsAvailable = true;
 else enum tlsAvailable = false;
 
+/// True when `host` designates a unix-domain socket (libpq convention: an absolute path).
+bool isUnixHost(string host) pure nothrow @nogc
+{
+    return host.length != 0 && host[0] == '/';
+}
+
+/// Socket file for a unix `host`: a directory gets `/.s.PGSQL.<port>` appended (libpq convention);
+/// a path that already names the socket file is used as is.
+string unixSocketPath(string host, ushort port) pure
+{
+    import std.conv : to;
+    import std.algorithm : canFind;
+    if (host.canFind(".s.PGSQL."))
+        return host;
+    while (host.length > 1 && host[$ - 1] == '/')
+        host = host[0 .. $ - 1];
+    return host ~ "/.s.PGSQL." ~ port.to!string;
+}
+
+/// Connect to an AF_UNIX stream socket through vibe-core.
+///
+/// vibe-core's connectTCP always bind()s the client socket before connecting, and an unnamed
+/// (empty-path) bind is rejected on some platforms. So the client end is bound to a unique
+/// temporary path, which is removed again as soon as the connection attempt has finished.
+private TCPConnection connectUnix(string path, Duration timeout)
+{
+    version (Posix)
+    {
+        import core.atomic : atomicOp;
+        import core.sys.posix.sys.un : sockaddr_un;
+        import core.sys.posix.unistd : unlink, getpid;
+        import std.conv : to;
+        import std.file : tempDir;
+        import std.string : toStringz;
+
+        static shared uint counter;
+
+        NetworkAddress server;
+        server.family = AddressFamily.UNIX;
+        NetworkAddress client;
+        client.family = AddressFamily.UNIX;
+
+        return () @trusted {
+            auto su = server.sockAddrUnix;
+            auto cu = client.sockAddrUnix;
+            if (path.length >= su.sun_path.length)
+                throw new PgException("unix socket path too long: " ~ path);
+
+            string local = tempDir() ~ "/pgd-" ~ getpid().to!string ~ "-" ~ atomicOp!"+="(counter, 1).to!string;
+            if (local.length >= cu.sun_path.length)
+                local = "/tmp/pgd-" ~ getpid().to!string ~ "-" ~ counter.to!string;
+
+            void fill(ref sockaddr_un sa, string p)
+            {
+                foreach (i, c; p)
+                    sa.sun_path[i] = cast(typeof(sa.sun_path[0])) c;
+                sa.sun_path[p.length] = 0;
+                static if (__traits(hasMember, sockaddr_un, "sun_len"))
+                    sa.sun_len = cast(ubyte) p.length; // vibe-core prints sun_path[0 .. sun_len]; the kernel ignores it
+            }
+            fill(*su, path);
+            fill(*cu, local);
+
+            const cLocal = toStringz(local);
+            unlink(cLocal);
+            scope (exit) unlink(cLocal);
+            return connectTCP(server, client, timeout);
+        }();
+    }
+    else
+        throw new PgException("unix-domain sockets are not supported on this platform");
+}
+
 package struct Transport
 {
     private TCPConnection sock;
@@ -42,12 +116,21 @@ package struct Transport
                              SslMode mode, string rootCert)
     {
         Transport t;
-        t.sock = connectTCP(host, port, null, 0, connectTimeout);
-        t.sock.tcpNoDelay = true;
+        const unix = isUnixHost(host);
+        if (unix)
+            t.sock = connectUnix(unixSocketPath(host, port), connectTimeout);
+        else
+        {
+            t.sock = connectTCP(host, port, null, 0, connectTimeout);
+            t.sock.tcpNoDelay = true;
+        }
         if (readTimeout != Duration.max)
             t.sock.readTimeout = readTimeout;
         try
-            t.negotiate(host, mode, rootCert);
+        {
+            if (!unix) // like libpq, never use TLS over a unix-domain socket
+                t.negotiate(host, mode, rootCert);
+        }
         catch (Exception e)
         {
             t.close();

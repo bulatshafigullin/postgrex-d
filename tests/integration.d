@@ -389,6 +389,69 @@ void testCopy(PgConnection db)
     check(db.query("select count(*) from cp5").scalar!long == 0, "copy rolled back");
 }
 
+void testUnixSocket()
+{
+    import postgrex.transport : unixSocketPath, isUnixHost;
+    check(unixSocketPath("/var/run/postgresql", 5432) == "/var/run/postgresql/.s.PGSQL.5432", "socket path from dir");
+    check(unixSocketPath("/tmp/", 54329) == "/tmp/.s.PGSQL.54329", "socket path trailing slash");
+    check(unixSocketPath("/x/.s.PGSQL.1", 5) == "/x/.s.PGSQL.1", "explicit socket file");
+    check(isUnixHost("/tmp") && !isUnixHost("localhost"), "isUnixHost");
+
+    const dir = environment.get("PGD_SOCKDIR", "/tmp");
+    auto tcp = ConnectOptions.fromUrl(base());
+    const port = tcp.port.to_str;
+    bool viaSocket(PgConnection c) { return c.query("select inet_server_addr() is null").scalar!bool; }
+
+    // percent-encoded host in the authority
+    auto o = ConnectOptions.fromUrl("postgres://" ~ tcp.user ~ ":" ~ tcp.password ~ "@%2F" ~ dir[1 .. $] ~ ":" ~ port ~ "/postgres");
+    check(o.host == dir, "URL host decoded: " ~ o.host);
+    auto c = new PgConnection(o);
+    c.connect();
+    check(viaSocket(c) && !c.encrypted, "connected through the unix socket");
+    check(c.query("select $1::int + 1", 41).scalar!int == 42, "query over unix socket");
+    check(c.query("select repeat('y', 500000)").scalar!string.length == 500000, "big result over unix socket");
+    ubyte[] blob = new ubyte[100000];
+    foreach (i, ref b; blob) b = cast(ubyte)(i * 7);
+    c.exec("create temp table ub(b bytea)");
+    c.exec("insert into ub values ($1)", blob);
+    check(c.query("select b from ub").scalar!(ubyte[]) == blob, "bytea over unix socket");
+    c.close();
+
+    // ?host= and ?port= forms; sslmode=require is ignored on local sockets (as in libpq)
+    o = ConnectOptions.fromUrl("postgres://" ~ tcp.user ~ ":" ~ tcp.password ~ "@/postgres?host=" ~ dir ~ "&port=" ~ port ~ "&sslmode=require");
+    c = new PgConnection(o);
+    c.connect();
+    check(viaSocket(c) && !c.encrypted, "?host= form, sslmode ignored");
+    c.close();
+
+    // statement timeout + cancel use the unix socket too
+    o.statementTimeout = 300.msecs;
+    c = new PgConnection(o);
+    c.connect();
+    try { c.query("select pg_sleep(10)"); check(false, "unix timeout"); }
+    catch (PgServerException e) { check(e.code == "57014", "cancel over unix socket"); }
+    check(c.query("select 1").scalar!int == 1, "usable after cancel over unix socket");
+    c.close();
+
+    // pool over the socket with concurrent fibers
+    o.statementTimeout = Duration.max;
+    auto pool = new PgPool(o, 4);
+    int done;
+    Task[] tasks;
+    foreach (i; 0 .. 4)
+        tasks ~= spawn({ pool.query("select pg_sleep(0.2)"); done++; });
+    foreach (t; tasks) t.join();
+    check(done == 4, "pool over unix socket");
+    pool.closeAll();
+
+    // errors
+    o.host = "/nonexistent-dir";
+    expectThrows({ auto b = new PgConnection(o); b.connect(); }, "missing socket");
+    o.host = "/" ~ "x".repeatStr(200);
+    expectThrows({ auto b = new PgConnection(o); b.connect(); }, "socket path too long");
+}
+string repeatStr(string s, int n) { string r; foreach (_; 0 .. n) r ~= s; return r; }
+
 void testNotify(PgConnection db, ConnectOptions o)
 {
     db.exec("listen chan");
@@ -492,6 +555,7 @@ void run()
     check(!db.connected, "closed");
     expectThrows!PgException({ auto b = new PgConnection("postgres://postgres:wrong@127.0.0.1:54329/postgres"); b.connect(); }, "bad password");
     testTls();
+    testUnixSocket();
     testCancel();
     testPool(o);
 }

@@ -31,6 +31,8 @@ enum TxStatus : char
 
 struct ConnectOptions
 {
+    /// Server host name or IP. A value starting with `/` is a unix-domain socket directory (the socket
+    /// `<dir>/.s.PGSQL.<port>` is used, as in libpq); TLS is not used on such connections.
     string host = "127.0.0.1";
     ushort port = 5432;
     string user = "postgres";
@@ -54,6 +56,8 @@ struct ConnectOptions
     string[string] parameters;
 
     /// Parse `postgres://user:pass@host:port/db?application_name=x&search_path=y`.
+    /// For a unix-domain socket use an absolute path as host, percent-encoded in the authority
+    /// (`postgres://user@%2Fvar%2Frun%2Fpostgresql/db`) or as `?host=/var/run/postgresql`.
     static ConnectOptions fromUrl(string url)
     {
         ConnectOptions o;
@@ -97,7 +101,7 @@ struct ConnectOptions
             rest = rest[0 .. c];
         }
         if (rest.length)
-            o.host = rest;
+            o.host = decodeComponent(rest); // %2Fvar%2Frun%2Fpostgresql => unix socket directory
         o.database = path.length ? decodeComponent(path) : o.user;
         foreach (kv; query.split("&"))
         {
@@ -120,6 +124,8 @@ struct ConnectOptions
                 }
                 break;
             case "sslrootcert": o.sslRootCert = v; break;
+            case "host": o.host = v; break;     // e.g. ?host=/var/run/postgresql
+            case "port": o.port = v.to!ushort; break;
             default: o.parameters[k] = v; break;
             }
         }

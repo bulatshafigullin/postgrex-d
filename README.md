@@ -7,7 +7,7 @@
 A PostgreSQL driver for [D](https://dlang.org), written from scratch against the wire protocol (v3) and
 modelled on Elixir's [Postgrex](https://github.com/elixir-ecto/postgrex).
 
-- **No libpq.** Pure D, talks to the server directly.
+- **No libpq.** Pure D, talks to the server directly over TCP, TLS or unix-domain sockets.
 - **Fiber-aware.** Built on [vibe-core](https://github.com/vibe-d/vibe-core) sockets: a query only suspends
   the calling fiber, never the event loop or the thread. Works in plain vibe-core programs and in
   [vibe.d](https://vibed.org) request handlers.
@@ -105,6 +105,21 @@ o.statementCacheSize = 128;        // 0 disables the prepared-statement cache
 o.parameters["search_path"] = "app";
 auto db2 = new PgConnection(o);
 ```
+
+### Unix-domain sockets
+
+A host that starts with `/` is a socket directory, exactly as in libpq (`<dir>/.s.PGSQL.<port>` is used):
+
+```d
+auto db = new PgConnection("postgres://app@%2Fvar%2Frun%2Fpostgresql/mydb");          // percent-encoded
+auto db2 = new PgConnection("postgres://app@/mydb?host=/var/run/postgresql&port=5433"); // query form
+ConnectOptions o; o.host = "/var/run/postgresql"; o.user = "app"; o.database = "mydb";   // explicit
+```
+
+TLS is never used on a unix socket (as in libpq, `sslmode` is ignored there). Pooling, cancellation,
+timeouts, COPY and the rest work the same. vibe-core binds the client end of the socket, so the driver
+briefly creates (and immediately removes) a uniquely named file in the temp directory per connection.
+Not available on Windows.
 
 Supported authentication: trust, cleartext, MD5, SCRAM-SHA-256 (the server signature is verified).
 Percent-encode special characters in URL passwords (`@` -> `%40`). URL parameters understood by the
@@ -380,7 +395,7 @@ streaming grows the heap by 0.6 MB. Build your application with `-O -release` (L
 
 ## Limitations
 
-Unix-domain sockets, binary result format, client certificates / channel binding, `SASLprep` for
+Binary result format, client certificates / channel binding, `SASLprep` for
 non-ASCII SCRAM passwords, and replication / logical decoding are not implemented yet. Contributions welcome.
 
 ## Development and testing
@@ -393,16 +408,14 @@ pg_ctl -D /tmp/pgd -o "-p 54329" start
 # for the TLS tests: a CA and a server certificate valid for localhost / 127.0.0.1 in $PGD_CERTS
 # (default /tmp/pgd_certs: ca.crt, other.crt = unrelated CA), then set ssl=on in postgresql.conf
 
-# integration tests (145 checks: types, params, errors, cache, transactions, notify, pool, streaming,
-# TLS, cancellation, COPY)
+# integration tests (160 checks: types, params, errors, cache, transactions, notify, pool, streaming,
+# TLS, unix sockets, cancellation, COPY; set PGD_SOCKDIR if the socket dir is not /tmp)
 cd tests && PGD_URL=postgres://postgres:secret@127.0.0.1:54329/postgres dub run
 
 # GC benchmark
 PGD_URL=... dub run --single bench/bench.d --build=release
 ```
 
-Layout: `source/postgrex/` -- `connection.d` (protocol state machine), `pool.d`, `result.d`, `types.d`
-(decoding), `encode.d` (parameter encoding), `transport.d` (TCP / TLS), `auth.d` (MD5/SCRAM), `wire.d` (framing), `error.d`.
 
 ## License
 
