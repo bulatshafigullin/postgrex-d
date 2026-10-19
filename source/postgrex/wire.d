@@ -10,7 +10,7 @@ import std.bitmanip : bigEndianToNative, nativeToBigEndian;
 package:
 
 /// Builds one frontend message: type byte, int32 length, payload.
-struct MsgWriter
+final class MsgWriter
 {
     Appender!(ubyte[]) buf;
     private size_t start;
@@ -46,6 +46,12 @@ struct MsgWriter
     {
         patch(start + (typed ? 1 : 0));
     }
+
+    /// Current write position (for length back-patching).
+    size_t length() { return buf.data.length; }
+
+    /// Overwrite the int32 at `pos`.
+    void patchInt32(size_t pos, int v) { buf.data[pos .. pos + 4] = nativeToBigEndian(v)[]; }
 
     const(ubyte)[] data() { return buf.data; }
     void clear() { buf.clear(); }

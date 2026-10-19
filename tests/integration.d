@@ -162,9 +162,66 @@ void testMapping(PgConnection db)
     db.exec("insert into users values (1,'ann',30),(2,'bob',null)");
     auto us = db.query("select * from users order by id").as!User;
     check(us.length == 2 && us[0].name == "ann" && us[0].age.get == 30 && us[1].age.isNull, "struct mapping");
+    int iterated; string names;
+    foreach (row; db.query("select * from users order by id")) { iterated++; names ~= row.get!string("name"); }
+    check(iterated == 2 && names == "annbob", "foreach over Result");
     check(db.exec("update users set age = 1") == 2, "rowsAffected");
     try { db.exec("insert into users values (1,'dup',1)"); }
     catch (PgServerException e) { check(e.code == "23505" && e.error.constraint == "users_pkey", "unique violation fields"); }
+}
+
+void testStreaming(PgConnection db)
+{
+    long sum;
+    string[] kept;
+    int nulls;
+    auto n = db.queryEach("select i, 'row ' || i, case when i % 3 = 0 then null else 1 end from generate_series(1, $1::int) i",
+        (Row r) {
+            sum += r.get!int(0);
+            kept ~= r.get!string(1);          // must be copied: the row buffer is reused
+            if (r.isNull(2)) nulls++;
+        }, 1000);
+    check(n == 1000 && sum == 500500, "queryEach rows/sum");
+    check(kept[0] == "row 1" && kept[999] == "row 1000" && kept[500] == "row 501", "streamed strings are copies");
+    check(nulls == 333, "streamed nulls");
+
+    // exception in callback: rows are drained, connection stays usable, exception propagates
+    int seen;
+    expectThrows({
+        db.queryEach("select generate_series(1, 100)", (Row r) {
+            seen++;
+            if (seen == 3) throw new Exception("stop");
+        });
+    }, "callback exception");
+    check(seen == 3, "callback not called after exception");
+    check(db.query("select 41 + 1").scalar!int == 42, "usable after callback exception");
+
+    // results keep their data after further queries (strings alias an immutable per-result buffer)
+    auto r1 = db.query("select 'alpha' a, '{x,\"y z\"}'::text[] b");
+    auto s1 = r1[0].get!string("a");
+    auto arr = r1[0].get!(string[])("b");
+    foreach (i; 0 .. 50) db.query("select repeat('z', 10000) || $1::text", i);
+    check(s1 == "alpha" && arr == ["x", "y z"], "results stay valid");
+
+    // a message larger than the read buffer, followed by small ones
+    auto big = db.query("select repeat('ab', 3000000) s");
+    check(big[0].get!string("s").length == 6_000_000, "big message");
+    check(db.query("select 1").scalar!int == 1, "small after big");
+}
+
+void testLru(PgConnection db)
+{
+    // statement cache of 4: the hot statement must survive eviction of cold ones
+    auto o = ConnectOptions.fromUrl(environment.get("PGD_URL", "postgres://postgres:secret@127.0.0.1:54329/postgres"));
+    o.statementCacheSize = 4;
+    auto c = new PgConnection(o);
+    c.connect();
+    scope (exit) c.close();
+    foreach (round; 0 .. 20)
+    {
+        check(c.query("select 'hot' || $1::int", round).scalar!string == "hot" ~ to_(round), "hot stmt");
+        c.query("select " ~ to_(round) ~ " + $1::int", 1);
+    }
 }
 
 void testNotify(PgConnection db, ConnectOptions o)
@@ -262,6 +319,8 @@ void run()
     testStatementCache(db);
     testTransactions(db);
     testMapping(db);
+    testStreaming(db);
+    testLru(db);
     testNotify(db, o);
     db.close();
     check(!db.connected, "closed");

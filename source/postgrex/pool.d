@@ -42,6 +42,12 @@ final class PgPool
         return c.query(sql, args);
     }
 
+    long queryEach(Args...)(string sql, scope void delegate(Row) @safe dg, auto ref Args args)
+    {
+        auto c = lock();
+        return c.queryEach(sql, dg, args);
+    }
+
     long exec(Args...)(string sql, auto ref Args args)
     {
         auto c = lock();

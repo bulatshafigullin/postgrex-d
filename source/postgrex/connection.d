@@ -5,6 +5,7 @@ module postgrex.connection;
 @safe:
 
 import postgrex.auth;
+import postgrex.encode;
 import postgrex.error;
 import postgrex.result;
 import postgrex.types;
@@ -125,6 +126,10 @@ final class PgConnection
     private bool open_;
     private RecursiveTaskMutex mutex;
     private MsgWriter w;
+    private ubyte[] rbuf;              // reused for every incoming message
+    private ubyte[] lastRowDesc;       // raw RowDescription of the previous result ...
+    private Column[] lastCols;         // ... and its parsed columns (shared between results)
+    private Cell[] rowScratch;         // cell index for streamed rows
     private TxStatus txStatus_ = TxStatus.idle;
     private int backendPid_;
     private int backendKey_;
@@ -132,9 +137,9 @@ final class PgConnection
     private Notification[] pendingNotifications;
     private size_t savepointDepth;
 
-    private struct Stmt { string name; }
+    private struct Stmt { string name; ulong used; }
     private Stmt[string] stmtCache;
-    private string[] stmtOrder;     // insertion order, for eviction
+    private ulong useClock;
     private string[] staleStmts;    // server side statements to Close on next command
     private uint stmtCounter;
 
@@ -147,6 +152,7 @@ final class PgConnection
     {
         this.opts = opts;
         mutex = new RecursiveTaskMutex;
+        w = new MsgWriter;
     }
 
     this(string url)
@@ -182,7 +188,6 @@ final class PgConnection
             txStatus_ = TxStatus.idle;
             savepointDepth = 0;
             stmtCache = null;
-            stmtOrder = null;
             staleStmts = null;
             pendingNotifications = null;
             serverParams_ = null;
@@ -253,7 +258,7 @@ final class PgConnection
         for (;;)
         {
             char type;
-            ubyte[] data;
+            size_t blen;
             try
             {
                 ubyte[5] hdr;
@@ -264,14 +269,18 @@ final class PgConnection
                 const len = bigEndianToNative!int(l);
                 if (len < 4 || len > 1_073_741_824)
                     throw new PgProtocolException("invalid message length from server");
-                data = new ubyte[len - 4];
-                if (data.length)
-                    sock.read(data);
+                blen = len - 4;
+                if (blen > rbuf.length)
+                    rbuf = new ubyte[blen < 8192 ? 8192 : blen];
+                else if (rbuf.length > (1 << 20) && blen <= 65536)
+                    rbuf = new ubyte[65536]; // give back memory after a huge message
+                if (blen)
+                    sock.read(rbuf[0 .. blen]);
             }
             catch (Exception e)
                 throw fail(e);
 
-            auto c = Cursor(data);
+            auto c = Cursor(rbuf[0 .. blen]);
             switch (type)
             {
             case 'N':
@@ -437,8 +446,7 @@ final class PgConnection
         send();
 
         Result[] results;
-        Result cur;
-        bool haveCols;
+        Collector col;
         Nullable!PgNotice err;
         for (;;)
         {
@@ -449,19 +457,18 @@ final class PgConnection
                 switch (t)
                 {
                 case 'T':
-                    cur = Result.init;
-                    cur.columns = parseRowDescription(c);
-                    haveCols = true;
+                    col.begin(parseRowDescription(c));
                     break;
                 case 'D':
-                    cur.rows ~= parseDataRow(c, cur.columns);
+                    col.addRow(c);
                     break;
                 case 'C':
-                    finishCommand(cur, c.cstr());
-                    results ~= cur;
-                    cur = Result.init;
-                    haveCols = false;
+                {
+                    auto tag = c.cstr();
+                    results ~= col.finish(tag, affectedRows(tag));
+                    col = Collector.init;
                     break;
+                }
                 case 'I':
                     results ~= Result.init;
                     break;
@@ -486,23 +493,31 @@ final class PgConnection
         }
     }
 
-    /// Execute a parameterised statement using the extended protocol; parameters are `$1`, `$2`, ...
-    Result queryParams(string sql, Param[] params)
+    private struct ExecState
     {
-        mutex.lock();
-        scope (exit) mutex.unlock();
+        Column[] columns;
+        string tag;
+        long affected;
+    }
+
+    /// Extended protocol round trip: [Close stale] [Parse] Bind Describe Execute Sync, one network write.
+    /// `onRow` is invoked for each DataRow with the message cursor positioned at the row.
+    private void runExtended(string sql, size_t nparams, scope void delegate(MsgWriter) @safe writeParams,
+                             scope void delegate(ref Cursor, Column[]) @safe onRow, ref ExecState st)
+    {
         requireOpen();
-        if (params.length > short.max)
+        if (nparams > short.max)
             throw new PgException("too many parameters");
 
         string stmtName = "";
         bool needParse = true;
-        bool cacheable = opts.statementCacheSize > 0;
+        const cacheable = opts.statementCacheSize > 0;
         if (cacheable)
         {
             if (auto s = sql in stmtCache)
             {
                 stmtName = s.name;
+                s.used = ++useClock;
                 needParse = false;
             }
             else
@@ -517,7 +532,6 @@ final class PgConnection
             w.cstr(n);
             w.finish(true);
         }
-        const nStale = staleStmts.length;
         staleStmts = null;
 
         if (needParse)
@@ -528,39 +542,26 @@ final class PgConnection
             w.int16(0); // let the server infer parameter types
             w.finish(true);
         }
-        // Bind
         w.begin('B');
         w.cstr("");
         w.cstr(stmtName);
         w.int16(0); // all params text
-        w.int16(cast(short) params.length);
-        foreach (ref p; params)
-        {
-            if (p.isNull) w.int32(-1);
-            else
-            {
-                w.int32(cast(int) p.text.length);
-                w.raw(cast(const(ubyte)[]) p.text);
-            }
-        }
+        w.int16(cast(short) nparams);
+        writeParams(w);
         w.int16(0); // all results text
         w.finish(true);
-        // Describe portal
         w.begin('D');
         w.byte_('P');
         w.cstr("");
         w.finish(true);
-        // Execute
         w.begin('E');
         w.cstr("");
         w.int32(0);
         w.finish(true);
-        // Sync
         w.begin('S');
         w.finish(true);
         send();
 
-        Result res;
         Nullable!PgNotice err;
         for (;;)
         {
@@ -570,17 +571,17 @@ final class PgConnection
             {
                 switch (t)
                 {
-                case '1', '2', '3', 'n', 's': break;
+                case '1', '2', '3', 'n', 's', 'I': break;
                 case 'T':
-                    res.columns = parseRowDescription(c);
+                    st.columns = parseRowDescription(c);
                     break;
                 case 'D':
-                    res.rows ~= parseDataRow(c, res.columns);
+                    onRow(c, st.columns);
                     break;
                 case 'C':
-                    finishCommand(res, c.cstr());
+                    st.tag = c.cstr();
+                    st.affected = affectedRows(st.tag);
                     break;
-                case 'I': break;
                 case 'E':
                     err = parseNotice(c);
                     break;
@@ -595,7 +596,7 @@ final class PgConnection
                     }
                     if (needParse && cacheable)
                         remember(sql, stmtName);
-                    return res;
+                    return;
                 default:
                     throw new PgProtocolException("unexpected message '" ~ t ~ "'");
                 }
@@ -607,18 +608,46 @@ final class PgConnection
         }
     }
 
-    /// Execute a parameterised statement. Parameters are converted with `toParam`.
+    /// Execute a statement with parameters given as a runtime list.
+    Result queryParams(string sql, scope const(Param)[] params)
+    {
+        mutex.lock();
+        scope (exit) mutex.unlock();
+        Collector col;
+        ExecState st;
+        runExtended(sql, params.length, (MsgWriter mw) {
+            foreach (ref p; params)
+                writeParam(mw, p);
+        }, (ref Cursor c, Column[] cols) {
+            if (col.columns is null)
+                col.begin(cols);
+            col.addRow(c);
+        }, st);
+        if (col.columns is null)
+            col.begin(st.columns);
+        return col.finish(st.tag, st.affected);
+    }
+
+    /// Execute a parameterised statement; parameters are `$1`, `$2`, ... and are sent separately from
+    /// the SQL text. Supported argument types: bool, integers, floats, string, ubyte[], SysTime, Date,
+    /// DateTime, arrays of those, `Nullable!T`, `null`, `Param`, `PgValue`.
     Result query(Args...)(string sql, auto ref Args args)
     {
-        static if (Args.length == 0)
-            return queryParams(sql, null);
-        else
-        {
-            Param[Args.length] ps;
-            static foreach (i, A; Args)
-                ps[i] = toParam(args[i]);
-            return queryParams(sql, ps[].dup);
-        }
+        mutex.lock();
+        scope (exit) mutex.unlock();
+        Collector col;
+        ExecState st;
+        runExtended(sql, Args.length, (MsgWriter mw) {
+            static foreach (i; 0 .. Args.length)
+                writeParam(mw, args[i]);
+        }, (ref Cursor c, Column[] cols) {
+            if (col.columns is null)
+                col.begin(cols);
+            col.addRow(c);
+        }, st);
+        if (col.columns is null)
+            col.begin(st.columns);
+        return col.finish(st.tag, st.affected);
     }
 
     /// Run a statement and return the number of affected rows.
@@ -627,12 +656,75 @@ final class PgConnection
         return query(sql, args).rowsAffected;
     }
 
+    /// Stream a result set: `dg` is called once per row with a `Row` that is only valid during the
+    /// call (use `get!string` etc. to copy what you need). Nothing is buffered, so memory use is
+    /// constant regardless of result size. Returns the number of rows. An exception from `dg`
+    /// is rethrown after the remaining rows have been drained (the connection stays usable).
+    long queryEach(Args...)(string sql, scope void delegate(Row) @safe dg, auto ref Args args)
+    {
+        return queryEachImpl(sql, dg, (MsgWriter mw) {
+            static foreach (i; 0 .. Args.length)
+                writeParam(mw, args[i]);
+        }, Args.length);
+    }
+
+    /// ditto
+    long queryEach(Args...)(string sql, scope void delegate(Row) dg, auto ref Args args) @system
+    {
+        return queryEachImpl(sql, dg, (MsgWriter mw) {
+            static foreach (i; 0 .. Args.length)
+                writeParam(mw, args[i]);
+        }, Args.length);
+    }
+
+    private long queryEachImpl(D)(string sql, scope D dg, scope void delegate(MsgWriter) @safe writeParams, size_t nparams)
+    {
+        mutex.lock();
+        scope (exit) mutex.unlock();
+        Exception pending;
+        long count;
+        ExecState st;
+        runExtended(sql, nparams, writeParams, (ref Cursor c, Column[] cols) {
+            if (pending !is null)
+                return;
+            const all = c.d;
+            const n = c.int16();
+            if (n != cols.length)
+                throw new PgProtocolException("DataRow does not match RowDescription");
+            if (rowScratch.length < n)
+                rowScratch = new Cell[n < 16 ? 16 : n];
+            foreach (i; 0 .. n)
+            {
+                const len = c.int32();
+                if (len < 0)
+                    rowScratch[i] = Cell(0, -1);
+                else
+                {
+                    rowScratch[i] = Cell(cast(uint)(all.length - c.d.length), len);
+                    c.bytes(len);
+                }
+            }
+            count++;
+            try (() @trusted { dg(Row(cols, all, rowScratch[0 .. n], false)); })();
+            catch (Exception e) { pending = e; }
+        }, st);
+        if (pending !is null)
+            throw pending;
+        return count;
+    }
+
     private void remember(string sql, string name)
     {
-        stmtCache[sql] = Stmt(name);
-        stmtOrder ~= sql;
-        while (stmtOrder.length > opts.statementCacheSize)
-            evict(stmtOrder[0]);
+        stmtCache[sql] = Stmt(name, ++useClock);
+        if (stmtCache.length > opts.statementCacheSize)
+        {
+            // evict the least recently used entry (never the one just added)
+            string victim;
+            ulong oldest = ulong.max;
+            foreach (k, ref v; stmtCache)
+                if (v.used < oldest) { oldest = v.used; victim = k; }
+            evict(victim);
+        }
     }
 
     private void evict(string sql)
@@ -642,16 +734,13 @@ final class PgConnection
             staleStmts ~= s.name;
             stmtCache.remove(sql);
         }
-        foreach (i, k; stmtOrder)
-            if (k == sql)
-            {
-                stmtOrder = stmtOrder[0 .. i] ~ stmtOrder[i + 1 .. $];
-                break;
-            }
     }
 
     private Column[] parseRowDescription(ref Cursor c)
     {
+        const raw = c.d;
+        if (lastRowDesc.length != 0 && raw == lastRowDesc)
+            return lastCols; // same shape as last time: share the column metadata
         const n = c.int16();
         auto cols = new Column[n];
         foreach (ref col; cols)
@@ -664,36 +753,25 @@ final class PgConnection
             col.typeMod = c.int32();
             c.int16(); // format code: always text
         }
+        lastRowDesc = raw.dup;
+        lastCols = cols;
         return cols;
     }
 
-    private Row parseDataRow(ref Cursor c, Column[] cols)
+    private static long affectedRows(string tag)
     {
-        const n = c.int16();
-        if (n != cols.length)
-            throw new PgProtocolException("DataRow does not match RowDescription");
-        Row r;
-        r.columns = cols;
-        r.values = new PgValue[n];
-        foreach (i; 0 .. n)
+        import std.string : lastIndexOf;
+        const sp = tag.lastIndexOf(' ');
+        if (sp < 0 || sp + 1 >= tag.length)
+            return 0;
+        long v;
+        foreach (ch; tag[sp + 1 .. $])
         {
-            const len = c.int32();
-            if (len < 0)
-                continue; // NULL
-            r.values[i] = decodeText(cols[i].typeOid, cast(const(char)[]) c.bytes(len));
+            if (ch < '0' || ch > '9')
+                return 0;
+            v = v * 10 + (ch - '0');
         }
-        return r;
-    }
-
-    private void finishCommand(ref Result r, string tag)
-    {
-        r.commandTag = tag;
-        auto parts = tag.split(' ');
-        if (parts.length > 1)
-        {
-            try r.rowsAffected = parts[$ - 1].to!long;
-            catch (Exception) {}
-        }
+        return v;
     }
 
     // -------------------------------------------------------------- transactions

@@ -310,15 +310,22 @@ private bool parseTimestamp(const(char)[] t, bool withTz, out SysTime st)
         if (withTz && i < t.length && (t[i] == '+' || t[i] == '-'))
         {
             const sign = t[i] == '-' ? -1 : 1;
-            auto parts = t[i + 1 .. $];
-            int h = 0, m = 0, s = 0;
-            import std.string : split;
-            auto p = parts.split(':');
-            h = p[0].to!int;
-            if (p.length > 1) m = p[1].to!int;
-            if (p.length > 2) s = p[2].to!int;
-            offset = sign * (hours(h) + minutes(m) + seconds(s));
-            if (t.length > i && i + 1 + parts.length != t.length) return false;
+            // +HH[:MM[:SS]]
+            int[3] part;
+            size_t k = i + 1, pi = 0;
+            for (; k < t.length && pi < 3; pi++)
+            {
+                int v = 0;
+                const startK = k;
+                while (k < t.length && t[k] >= '0' && t[k] <= '9')
+                    v = v * 10 + (t[k++] - '0');
+                if (k == startK) return false;
+                part[pi] = v;
+                if (k < t.length && t[k] == ':') k++;
+                else break;
+            }
+            if (k != t.length) return false;
+            offset = sign * (hours(part[0]) + minutes(part[1]) + seconds(part[2]));
         }
         else if (i != t.length)
             return false;
@@ -457,4 +464,178 @@ Param toParam(T)(auto ref const T v)
     }
     else
         static assert(false, "cannot encode " ~ T.stringof ~ " as a PostgreSQL parameter");
+}
+
+// ---------------------------------------------------------------------------
+// typed decoding straight from text (no PgValue intermediate)
+// ---------------------------------------------------------------------------
+
+private bool parseLong(const(char)[] t, out long r)
+{
+    if (t.length == 0) return false;
+    size_t i = 0;
+    bool neg;
+    if (t[0] == '-') { neg = true; i = 1; }
+    if (i == t.length) return false;
+    ulong v;
+    for (; i < t.length; i++)
+    {
+        const d = t[i] - '0';
+        if (d < 0 || d > 9) return false;
+        if (v > (ulong.max - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    if (neg) { if (v > cast(ulong) long.max + 1) return false; r = cast(long)(-v); }
+    else { if (v > long.max) return false; r = cast(long) v; }
+    return true;
+}
+
+/// Decode a text-format cell directly into `T`. If `stable` the text lives in an immutable,
+/// never reused buffer and strings may alias it instead of being copied.
+T decodeAs(T)(uint oid, const(char)[] txt, bool stable)
+{
+    static if (is(T == PgValue))
+        return decodeText(oid, txt);
+    else static if (isInstanceOf!(Nullable, T))
+        return T(decodeAs!(typeof(T.init.get()))(oid, txt, stable));
+    else static if (is(T == bool))
+    {
+        if (oid == Oid.bool_) return txt.length && (txt[0] == 't' || txt[0] == 'T');
+        long l;
+        if (parseLong(txt, l)) return l != 0;
+    }
+    else static if (isIntegral!T)
+    {
+        long l;
+        if (parseLong(txt, l))
+        {
+            static if (isSigned!T) { if (l < T.min || l > T.max) throw new PgTypeException("value " ~ txt.idup ~ " out of range for " ~ T.stringof); }
+            else { if (l < 0 || cast(ulong) l > T.max) throw new PgTypeException("value " ~ txt.idup ~ " out of range for " ~ T.stringof); }
+            return cast(T) l;
+        }
+        if (oid == Oid.numeric)
+        {
+            try return txt.to!T;
+            catch (ConvException) {}
+        }
+    }
+    else static if (isFloatingPoint!T)
+    {
+        if (oid == Oid.float4 || oid == Oid.float8 || oid == Oid.numeric || oid == Oid.int2 || oid == Oid.int4 || oid == Oid.int8)
+        {
+            try return txt.to!T;
+            catch (ConvException) {}
+        }
+    }
+    else static if (is(T == string))
+    {
+        if (stable) return (() @trusted => cast(string) txt)();
+        return txt.idup;
+    }
+    else static if (isSomeString!T)
+        return txt.to!T;
+    else static if (is(T == ubyte[]))
+    {
+        if (oid == Oid.bytea) return decodeBytea(txt);
+    }
+    else static if (is(T == SysTime))
+    {
+        SysTime st;
+        if (oid == Oid.date ? parseDate(txt, st) : parseTimestamp(txt, oid == Oid.timestamptz, st)) return st;
+    }
+    else static if (is(T == DateTime) || is(T == Date))
+    {
+        SysTime st;
+        if (oid == Oid.date ? parseDate(txt, st) : parseTimestamp(txt, oid == Oid.timestamptz, st))
+            return cast(T) st;
+    }
+    else static if (isArray!T)
+    {
+        const el = arrayElementOid(oid);
+        if (el)
+        {
+            size_t pos = 0;
+            if (txt.length && txt[0] == '[')
+            {
+                import std.string : indexOf;
+                const eq = txt.indexOf('=');
+                if (eq >= 0) pos = eq + 1;
+            }
+            return parseArrayAs!T(el, txt, pos, stable);
+        }
+    }
+    else
+        static assert(false, "cannot decode into " ~ T.stringof);
+    throw new PgTypeException("cannot convert value '" ~ txt.idup ~ "' (oid " ~ oid.to!string ~ ") to " ~ T.stringof);
+}
+
+private enum isNestedArr(E) = isArray!E && !isSomeString!E && !is(E == ubyte[]);
+
+private T parseArrayAs(T)(uint elemOid, const(char)[] t, ref size_t pos, bool stable)
+{
+    import std.array : Appender;
+    alias E = Unqual!(ForeachType!T);
+    if (pos >= t.length || t[pos] != '{')
+        throw new PgTypeException("malformed array literal: " ~ t.idup);
+    pos++;
+    Appender!(E[]) r;
+    if (pos < t.length && t[pos] == '}') { pos++; return cast(T) r.data; }
+    while (pos < t.length)
+    {
+        static if (isNestedArr!E)
+            r.put(parseArrayAs!E(elemOid, t, pos, stable));
+        else
+        {
+            static if (isInstanceOf!(Nullable, E)) alias U = typeof(E.init.get());
+            else alias U = E;
+            const(char)[] tok;
+            bool quoted, aliasable = stable;
+            if (t[pos] == '"')
+            {
+                quoted = true;
+                pos++;
+                const st = pos;
+                bool esc;
+                while (pos < t.length && t[pos] != '"')
+                {
+                    if (t[pos] == '\\') { esc = true; pos++; }
+                    pos++;
+                }
+                if (esc)
+                {
+                    char[] buf;
+                    for (size_t j = st; j < pos; j++)
+                    {
+                        if (t[j] == '\\') j++;
+                        buf ~= t[j];
+                    }
+                    tok = buf;
+                    aliasable = false;
+                }
+                else
+                    tok = t[st .. pos];
+                pos++; // closing quote
+            }
+            else
+            {
+                const st = pos;
+                while (pos < t.length && t[pos] != ',' && t[pos] != '}') pos++;
+                tok = t[st .. pos];
+            }
+            if (!quoted && tok == "NULL")
+            {
+                static if (isInstanceOf!(Nullable, E)) r.put(E.init);
+                else throw new PgTypeException("NULL array element cannot be converted to " ~ E.stringof);
+            }
+            else
+            {
+                static if (isInstanceOf!(Nullable, E)) r.put(E(decodeAs!U(elemOid, tok, aliasable)));
+                else r.put(decodeAs!U(elemOid, tok, aliasable));
+            }
+        }
+        if (pos >= t.length) break;
+        if (t[pos] == ',') { pos++; continue; }
+        if (t[pos] == '}') { pos++; return cast(T) r.data; }
+    }
+    throw new PgTypeException("unterminated array literal: " ~ t.idup);
 }
